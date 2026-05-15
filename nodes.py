@@ -3,6 +3,8 @@ import sys
 import re
 import math
 import copy
+import importlib.util
+from urllib.parse import urlparse
 from enum import Enum
 from collections import OrderedDict
 import folder_paths as comfy_paths
@@ -62,6 +64,12 @@ SUPPORTED_3D_EXTENSIONS = (
 SUPPORTED_3DGS_EXTENSIONS = (
     '.ply',
 )
+
+SUPPORTED_TWITTER_VIDEO_HOSTS = (
+    'twitter.com',
+    'x.com',
+)
+
 
 ELEVATION_MIN = -90
 ELEVATION_MAX = 90.0
@@ -268,6 +276,134 @@ class Save_3DGS:
         
         return (save_path, )
     
+def validate_twitter_video_url(url):
+    parsed_url = urlparse(url.strip())
+    hostname = parsed_url.hostname.lower() if parsed_url.hostname else ''
+    normalized_hostname = hostname[4:] if hostname.startswith('www.') else hostname
+
+    if parsed_url.scheme not in ('http', 'https') or normalized_hostname not in SUPPORTED_TWITTER_VIDEO_HOSTS:
+        raise ValueError(
+            f"Twitter video URL must be an http(s) URL from one of these hosts: {SUPPORTED_TWITTER_VIDEO_HOSTS}"
+        )
+
+    return parsed_url.geturl()
+
+
+def prepare_twitter_video_output(output_folder, filename_template):
+    output_folder = output_folder.strip() or 'twitter'
+    output_folder = os.path.normpath(output_folder.replace('\\', '/'))
+
+    if os.path.isabs(output_folder) or output_folder == '..' or output_folder.startswith(f"..{os.sep}"):
+        raise ValueError('Output folder must be a relative path inside the ComfyUI output directory')
+
+    filename_template = filename_template.strip() or 'Twitter_%(id)s.%(ext)s'
+    if os.path.basename(filename_template) != filename_template:
+        raise ValueError('Filename template must not include folder separators')
+
+    root_path = os.path.join(comfy_paths.output_directory, output_folder)
+    os.makedirs(root_path, exist_ok=True)
+
+    if '%(ext)s' not in filename_template:
+        filename_template = f"{filename_template}.%(ext)s"
+
+    return os.path.join(root_path, filename_template)
+
+
+def find_downloaded_twitter_video(info, output_template):
+    requested_downloads = info.get('requested_downloads') or []
+    for download in requested_downloads:
+        filepath = download.get('filepath')
+        if filepath and os.path.exists(filepath):
+            return filepath
+
+    ext = info.get('ext') or '*'
+    candidate_path = output_template.replace('%(ext)s', ext)
+    if os.path.exists(candidate_path):
+        return candidate_path
+
+    root_path = os.path.dirname(output_template)
+    video_id = info.get('id')
+    if video_id:
+        candidates = [
+            os.path.join(root_path, filename)
+            for filename in os.listdir(root_path)
+            if video_id in filename
+        ]
+        candidates = [path for path in candidates if os.path.isfile(path)]
+        if candidates:
+            return max(candidates, key=os.path.getmtime)
+
+    raise FileNotFoundError('yt-dlp completed, but the downloaded Twitter video file could not be found')
+
+
+class Download_Twitter_Video:
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "url": ("STRING", {"default": '', "multiline": False}),
+                "output_folder": ("STRING", {"default": 'twitter', "multiline": False}),
+                "filename_template": ("STRING", {"default": 'Twitter_%(id)s.%(ext)s', "multiline": False}),
+                "quality": (["best", "best_mp4", "worst"], ),
+            },
+            "optional": {
+                "cookies_file": ("STRING", {"default": '', "multiline": False}),
+            },
+        }
+
+    OUTPUT_NODE = True
+    RETURN_TYPES = (
+        "STRING",
+    )
+    RETURN_NAMES = (
+        "video_file_path",
+    )
+    FUNCTION = "download_video"
+    CATEGORY = "Comfy3D/Import|Export"
+
+    def download_video(self, url, output_folder, filename_template, quality, cookies_file=''):
+        if importlib.util.find_spec('yt_dlp') is None:
+            raise RuntimeError('yt-dlp is required to download Twitter/X videos. Install this node pack requirements again.')
+
+        import yt_dlp
+
+        validated_url = validate_twitter_video_url(url)
+        output_template = prepare_twitter_video_output(output_folder, filename_template)
+        format_selector = {
+            'best': 'bv*+ba/best',
+            'best_mp4': 'bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/best',
+            'worst': 'worst',
+        }[quality]
+
+        ydl_opts = {
+            'format': format_selector,
+            'outtmpl': output_template,
+            'noplaylist': True,
+            'restrictfilenames': True,
+            'quiet': False,
+            'no_warnings': False,
+        }
+
+        if quality == 'best_mp4':
+            ydl_opts['merge_output_format'] = 'mp4'
+
+        cookies_file = cookies_file.strip()
+        if cookies_file:
+            if not os.path.isabs(cookies_file):
+                cookies_file = os.path.join(comfy_paths.input_directory, cookies_file)
+            if not os.path.exists(cookies_file):
+                raise FileNotFoundError(f'Cookies file does not exist: {cookies_file}')
+            ydl_opts['cookiefile'] = cookies_file
+
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(validated_url, download=True)
+
+        video_file_path = find_downloaded_twitter_video(info, output_template)
+        cstr(f"[{self.__class__.__name__}] Downloaded Twitter/X video to {video_file_path}").msg.print()
+        return (video_file_path, )
+
+
 class Switch_3DGS_Axis:
     @classmethod
     def INPUT_TYPES(cls):
@@ -1096,7 +1232,7 @@ class Triplane_Gaussian_Transformers:
         # Output rendered video, for testing this node only
         tgs_model.save_img_sequences(
             "video",
-            "(\d+)\.png",
+            "(\\d+)\\.png",
             save_format="mp4",
             fps=30,
             delete=True,

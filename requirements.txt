@@ -43,3 +43,5 @@ tqdm
 jaxtyping
 packaging
 OmegaConf
+
+yt-dlp
